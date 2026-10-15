@@ -134,6 +134,11 @@ It contains:
 - **Auth.** Taken from `isAuthActive`, `resolveAuthIn`, `resolveAuthName`,
   `resolveAuthPrefix` and `isHttpBasicAuth`. Through these, the mock expects a
   credential exactly where the generated SDK sends one.
+  - v1 supports an API key in a header, query parameter or cookie, and a
+    bearer token.
+  - For HTTP Basic, or a scheme with a token exchange (`info.security.exchange`),
+    generation fails with an explicit unsupported-auth error rather than emit
+    a server its own SDK cannot call (§4.3).
 - **Info.** The title, the version, and the base path taken from
   `info.servers[0].url`.
 
@@ -237,12 +242,18 @@ deterministic.
   by a hash-seeded PRNG stream per cell. Adding a field or raising a count
   therefore does not reshuffle any value that already exists, so diffs of the
   generated CSV stay reviewable.
-- **Entities are generated parents first**, ordered by `relations.ancestors`
-  and required path parameters.
-  - `ref` and parent keys draw from records that already exist, so a nested
-    route such as `/planet/{planet_id}/moon` always has data.
-  - `count: { per: 'planet', … }` distributes child records across their
-    parents.
+- **Keys first, then fields.** A record's key is itself a pure function of
+  `(seed, entity, index)`. Every entity's keys are minted in a first pass, and
+  fields are filled in a second.
+  - `ref` therefore resolves for self-references (`employee.manager_id`) and
+    for cycles (`a → b → a`), as well as for parents.
+  - A `ref` that should sometimes be empty, such as a root manager, says so
+    with `null: p`.
+- **Child counts need an acyclic parent graph.** `count: { per: 'planet', … }`
+  distributes child records across their parents, ordered by
+  `relations.ancestors` and required path parameters.
+  - A cycle in that graph is rejected at generation, with the cycle named.
+  - A nested route such as `/planet/{planet_id}/moon` always has data.
 - **Every record is validated** against the entity's data spec before it is
   written. The spec comes from sdkgen's `entityDataSpec`, the same
   `@voxgig/struct` spec the generated SDK validates with, so the dataset passes
@@ -357,9 +368,16 @@ logins later can bridge accounts onto `sys/user`.
 3. Verify the HMAC, then load the account and check its status.
 4. Return `{ account_id, kid, scopes }`.
 
+Schemes outside step 1's list are refused at generation (§2), so the server
+never expects a credential its SDK cannot send.
+
 A successful verification is cached per isolate for a short time (default 30 s,
-in an LRU) to save store reads. Revocation therefore takes effect within that
-time, and the README says so.
+in an LRU) to save store reads.
+
+- **Expiry stays exact.** The cache entry keeps the key's `expires`, and checks
+  it again on every hit.
+- **Revocation does not.** Revocation and account suspension take effect
+  within the cache time, and the README says so.
 
 An API whose model declares no authentication gets a single implicit account.
 The per-account machinery still runs; it just never varies.
@@ -388,7 +406,8 @@ CLI.
 
 | where | how |
 |---|---|
-| Fastify, local | Use the CLI, `npx devapi-access account create alice` and `npx devapi-access key create alice`, which works directly on the SQLite file. In dev mode, the server also registers the key in `<ENV>_APIKEY` for a `dev` account if it is set and well formed, and otherwise prints a fresh key at startup. The SDK's live suite and seneca-provider's live tests then run with nothing to configure. |
+| Fastify, local | Use the CLI, `npx devapi-access account create alice` and `npx devapi-access key create alice`, which works directly on the SQLite file. |
+| Fastify, dev mode | The server gives a `dev` account a stable local key. It uses the key in `<ENV>_APIKEY` if that is set and well formed. Otherwise it creates one on first start, writes it to the gitignored `.devapi/dev.env` as `<ENV>_APIKEY=…`, and reuses it on later starts. The generated `test:sdk` script and the live-suite instructions load that file, so the SDK's live suite gets the key without anyone copying it from stdout. In CI, where the two processes start separately, the job sets `<ENV>_APIKEY` to any well-formed key (`npm run dev-key` prints one) and the server registers it. |
 | Workers | Admin routes under `/_devapi/admin/` are authenticated with `Bearer $DEVAPI_ADMIN_TOKEN` (a Wrangler secret) and are disabled when it is unset. The same CLI drives them with `--remote <url>`. |
 | Both | The admin routes also exist under Fastify, so the two servers expose the same surface. |
 
@@ -439,12 +458,13 @@ The rejected alternatives:
 
 | op | behaviour |
 |---|---|
-| list | The merged view, filtered by the route's required path and query parameters (parents first), and optionally by equality on query parameters that name fields. Seed order first, then creation order. Paging applies only where `serve.paging` names the parameters (open question Q2). |
+| list | The merged view, filtered by the route's parent path parameters and by any query parameter that names a record field. Other required parameters, such as `q` or `locale`, are checked for presence but never filter, because no seed record carries them. (The SDK `test` feature filters on every required parameter; the mock deliberately does not.) Seed order first, then creation order. Paging applies only where `serve.paging` names the parameters (open question Q2). |
 | load | The account's `put` row if there is one; 404 if it has a `del`; otherwise the seed record; otherwise 404. |
 | create | The record key is minted unless the create sends it, the case seneca-provider calls `rkOnCreate`. A key that already exists answers 409. Read-only fields the request did not send, such as `created_at`, are filled by the entity's generator rules, so a created record looks like a seeded one. The status is the spec's success code: 201 where the spec says 201. |
 | update / patch | 404 if the record is absent. Otherwise the body is merged into the record, keeping the key, the parents and read-only fields. Merging on update matches the SDK `test` feature. `serve.put: replace` switches update to PUT-as-replace. |
 | remove | 404 if the record is absent. Otherwise a `del` row is written. The status is the spec's (200 or 204). |
-| action | Loads the record (404 if absent), merges the body and returns the record. This is a generic default, and the expected place to customise (5.5). |
+| action on a record | Applies when the route addresses a record key. Loads the record (404 if absent), merges the body and returns the record. This is a generic default, and the expected place to customise (5.5). |
+| action on a collection | Applies when there is no record key: an import, a search or a bulk operation. With no record to default to, the route answers 501 and the generated README lists it, until a Seneca override implements it (5.5). A default built from the spec's response schema is later work (§16). |
 
 **Responses are wrapped the way the route's response transform `t.res`
 unwraps them**: `body.data` is nested, and `$EACH` with `$MERGE` wraps each
@@ -456,7 +476,19 @@ other.
 
 ### 5.3 Validation (D8)
 
-Requests are validated against the model-level specs sdkgen already builds for
+**Request bodies are decoded first.** A route's request transform `t.req` is
+how the SDK turns its logical record into the wire body, and it can nest or
+rename fields. The engine applies the inverse to an incoming body before it
+validates or stores anything.
+
+- Validation therefore sees the shape `entityOpSpec` describes, and the
+  overlay stores records, not envelopes.
+- The inverse is derived at generation time. A transform that cannot be
+  inverted is reported at generation, and its route answers 501.
+- Request transforms join response transforms in the shared case table, and
+  the round-trip suite covers both directions.
+
+The decoded body is then validated against the model-level specs sdkgen already builds for
 the SDK (`entityOpSpec`, `canonToSpec`), using `@voxgig/struct`'s interpreting
 validator.
 
@@ -546,8 +578,8 @@ devapi-fastify/                    # in-tree by default; see note on app/
   seneca-provider's live tests expect a server in the SDK repo's `app/`, and
   until now that server was hand-written (`ts/test/solardemo/app`). A project
   can set `main: kit: target: 'devapi-fastify': output: path: 'app'` and get a
-  generated one, with the dev-key bootstrap from 4.6 making the live suites
-  pass with nothing to configure.
+  generated one. The dev key from 4.6 reaches the live suites through
+  `.devapi/dev.env` locally, or through `<ENV>_APIKEY` in CI.
 
 ---
 
@@ -561,7 +593,6 @@ devapi-cfw/
   devapi.json  src/data/seed.json  # bundled into the Worker
   migrations/0001_devapi.sql       # identical to devapi-fastify's
   src/pages/[...path].ts           # export const ALL = devapiHandler
-  src/pages/index.astro            # landing page: API, version, how to authenticate
   src/lib/seneca.ts                # lazy, once-per-isolate Seneca with the D1 store
   src/custom.ts                    # user-owned (5.5)
   test/worker.test.ts              # node:test driving the built Worker with Miniflare
@@ -593,16 +624,27 @@ devapi-cfw/
      `wrangler.jsonc`, so the id cannot live there.
   2. Set `DEVAPI_KEY_PEPPER` and `DEVAPI_ADMIN_TOKEN` with
      `wrangler secret put`.
-  3. Run `npm run deploy`, which runs the remote migrations, `astro build` and
-     `wrangler deploy`.
+  3. Run `npm run deploy`. It runs `astro build` first, so a failed build
+     touches nothing, then the remote migrations, then `wrangler deploy`.
+     The old Worker can still be serving while the new schema is in place, so
+     migrations are additive only: expand now, contract in a later release.
+     The runtime checks its schema version at startup.
 
   A generated GitHub deploy workflow is deferred (§16).
 - **Tests** run inside workerd rather than Node: Miniflare runs the built
   Worker against a local D1, driven from `node:test`, so the runner is the same
   as everywhere else.
 
-`index.astro` is deliberately where a developer portal would start: Astro is
-already the framework, and the deployment already exists.
+**The landing page** gives the API name and version and says how to
+authenticate. The dispatcher serves it at `/_devapi/`, on both servers.
+
+- **It is not an Astro page.** A static `src/pages/index.astro` would take
+  priority over the catch-all and shadow a root API route. Astro also excludes
+  `_`-prefixed paths from file routing.
+- **`/` redirects to it** only when the model has no root route.
+- **A developer portal** (§16) would add Astro pages under a configurable
+  prefix, checked against the model's routes in the same way. Astro is already
+  the framework, and the deployment already exists.
 
 ---
 
@@ -731,9 +773,9 @@ AGENTS.md (CLAUDE.md → AGENTS.md)  COMMENT-POLICY.md  COMMENT-NOTES.md  README
 
 | layer | where | what |
 |---|---|---|
-| Runtime units | `voxgig/devapi` | The expander: determinism, integrity, and a golden CSV. Keys: generate, verify and revoke, with timing-safe comparison. Overlay semantics per operation. Response transforms, checked against a case table shared with `TestFeature.ts`. |
+| Runtime units | `voxgig/devapi` | The expander: determinism, integrity including self-references, and a golden CSV. Keys: generate, verify and revoke, with timing-safe comparison, and expiry honoured on a cache hit. Overlay semantics per operation. Request and response transforms, checked against a case table shared with `TestFeature.ts`. |
 | Store | `senecajs/seneca-sqlite-store` | `seneca-store-test` on `node:sqlite` and on D1 through Miniflare. |
-| Generation | here, on `@voxgig/sdkgen/testkit` | For each target on a solardemo-shaped fixture (planet; moon nested under planet; the `terraform` and `forbid` actions; create answering 201): the files emitted, no placeholder leaks, the "requires `devapi-data` and `devapi-access`" error, reserved-path collisions, the warning for an over-large seed, and out-of-tree generation through `outside`. |
+| Generation | here, on `@voxgig/sdkgen/testkit` | For each target on a solardemo-shaped fixture (planet; moon nested under planet; the `terraform` and `forbid` actions; create answering 201): the files emitted, no placeholder leaks, the "requires `devapi-data` and `devapi-access`" error, the unsupported-auth error, a cycle in `per` counts, reserved-path collisions, collection actions listed as 501, the warning for an over-large seed, and out-of-tree generation through `outside`. |
 | Servers | here, in `servers.yml` (heavier, like langpack's `sdks.yml`) | Generate both servers, install, build and run each: Fastify under Node, cfw under Miniflare. Run one request script against each. |
 | **Parity** | here, in `servers.yml` | The same script against both servers must give identical responses, once ids and timestamps are normalised. This is the property the Seneca layer exists to provide, so it is tested rather than assumed. |
 | SDK round trip | here, in `servers.yml` | Where `ts` is generated, its live suite runs against each server using a devapi-access key. |
@@ -832,8 +874,9 @@ Phases 2–4 can run in parallel once Phase 1 is done.
 **Not in v1:**
 
 - GraphQL points, raw or binary bodies, and webhooks;
-- OAuth flows (a bearer token is treated as an API key) and HTTP Basic
-  credentials;
+- HTTP Basic credentials and OAuth token exchanges, both refused at generation
+  (§2). A plain bearer token is served as an API key.
+- collection-level actions, which answer 501 until overridden (5.2);
 - per-API error schemas, request-rate limits and usage metering;
 - production-grade multi-region consistency. This is a developer API, although
   keys are handled to production standards regardless.
@@ -846,5 +889,6 @@ Phases 2–4 can run in parallel once Phase 1 is done.
    offline SDK suites run on realistic data.
 3. A seed held in a D1 table, for large datasets; a Durable Object per account
    for strong isolation.
-4. Spec-level validation (D8's alternative), and per-API error bodies.
+4. Spec-level validation (D8's alternative), per-API error bodies, and
+   collection-action defaults built from the spec's response schemas.
 5. A generated deploy workflow for `devapi-cfw`, and request-rate limits.
