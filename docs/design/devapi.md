@@ -1,7 +1,8 @@
 # devapi: mock developer APIs generated from the SDK model
 
-**Status: plan, revised after review.** The rulings from the first review are
-recorded in [Decisions](#15-decisions). Spike 0.1, which asked whether Seneca
+**Status: plan, revised after review.** The rulings are recorded in
+[Decisions](#15-decisions), including D17 and D18, which adopt the existing
+Seneca Cloudflare packages (§8). Spike 0.1, which asked whether Seneca
 runs on Cloudflare Workers, is done and passed
 ([Appendix A](#appendix-a-spike-01-seneca-on-workerd)). Nothing else is built
 yet.
@@ -24,7 +25,11 @@ initial dataset, API keys, and a server that answers the routes the SDK calls.
   them unchanged.
 - Each server generates only its own HTTP wiring, its request validation and
   its store set-up.
-- Storage is `@seneca/sqlite-store`, which gains a D1 driver (§8).
+- **One store serves both servers:** `@seneca/cloudflare-d1-store`. Workers
+  pass it the D1 binding; Node gets a new `node:sqlite` client (§8). Both
+  servers therefore have the same tables, SQL and migrations.
+- **The portal's way in** is `@seneca/gateway-cloudflare`, mounted as a
+  token-guarded admin endpoint (§4.5).
 
 ## Contents
 
@@ -35,7 +40,7 @@ initial dataset, API keys, and a server that answers the routes the SDK calls.
 5. [Request handling, shared by both servers](#5-request-handling-shared-by-both-servers)
 6. [devapi-fastify](#6-devapi-fastify)
 7. [devapi-cloudflare](#7-devapi-cloudflare)
-8. [@seneca/sqlite-store, with a D1 driver](#8-senecasqlite-store-with-a-d1-driver)
+8. [The Seneca Cloudflare packages](#8-the-seneca-cloudflare-packages)
 9. [Packages and repositories](#9-packages-and-repositories)
 10. [Model options](#10-model-options)
 11. [This repository](#11-this-repository)
@@ -89,8 +94,10 @@ running mock.
      │      validate (JSON Schema from the spec), extract the credential   │
      │  Seneca  sys:devapi-access,verify:key ─▶ account_id                 │
      │          sys:devapi-data,entity:<e>,op:<op> ─▶ { status, body }     │
-     │  seneca-entity ─▶ @seneca/sqlite-store: node driver | d1 driver     │
+     │  seneca-entity ─▶ @seneca/cloudflare-d1-store:                      │
+     │                     node:sqlite client (Fastify) | D1 binding (CF)  │
      └─────────────────────────────────────────────────────────────────────┘
+       admin endpoint: @seneca/gateway ─▶ allow-listed sys:devapi-* messages
 ```
 
 ### What each target owns
@@ -99,7 +106,7 @@ running mock.
 |---|---|
 | `devapi-data` | The data definition; the dataset; the per-account copy; every operation's behaviour, including request and response transforms. The plugin takes a wire-shaped body and returns a wire-shaped body, so the servers know nothing about entities. |
 | `devapi-access` | Accounts, as opaque ids with a status, and the keys issued under them. Where the credential travels, as the model's security scheme defines it. |
-| The servers | Routing, JSON-Schema validation, extracting the credential, mapping the plugins' answers to HTTP, store configuration, and serving the API definition. |
+| The servers | Routing, JSON-Schema validation, extracting the credential, mapping the plugins' answers to HTTP, store configuration, the admin endpoint, and serving the API definition. |
 
 **This pack holds the shared generation-time code.** Every target derives from
 the same model, so the derivations they share live in one component file in
@@ -254,20 +261,28 @@ writes only that copy.
 - **Who calls it.** In v1, the programmatic interface, the local CLI, or the
   Fastify server's dev-mode bootstrap (§4.6). Later, the portal.
 
-**How it is stored.**
+**How it is stored.** The layout is `@seneca/cloudflare-d1-store`'s own: one
+table per entity canon, holding `id TEXT PRIMARY KEY` and `data TEXT`, the
+record as JSON. It is the same on both servers, because both use that store
+(§8).
 
-- **One table per entity**, generated from the model. Each row has a surrogate
-  `id` (`<account_id>/<record key>`, which seneca-entity requires to be
-  unique), `account_id`, `rkey`, and one column per field. Objects and arrays
-  are stored as JSON text.
-- **One seed table per entity** (`devapi_seed_<entity>`), filled by the
-  generated `0002_seed.sql`, in multi-row inserts chunked to stay inside D1's
-  per-statement limits.
-- **Initialising an account is one `INSERT … SELECT` per entity**, from the
-  seed table into the account's rows. It runs through the store's native
-  handle, as one transaction under SQLite and one `batch()` on D1. The copy
-  therefore stays on the database side, and the Worker bundle does not carry
-  the dataset.
+- **Account tables.** `devapi_<entity>` holds every account's copy. Each row's
+  `id` is `<account_id>/<record key>`, which seneca-entity needs to be unique.
+  `data` carries `account_id` and `rkey` alongside the fields.
+- **Migrations create the tables, and an index on each.** The store creates a
+  missing table on first use (`CREATE TABLE IF NOT EXISTS`). The generated
+  migrations create the same tables first, each with an expression index on
+  `json_extract(data, '$.account_id')`, so that per-account queries do not
+  scan every account's rows.
+- **Seed tables.** `devapi_seed_<entity>` has the same layout, and is filled
+  by the generated `0002_seed.sql` in multi-row inserts chunked to stay inside
+  D1's per-statement limits.
+- **Initialising an account is one `INSERT … SELECT` per entity.** It copies
+  the seed table into the account's rows, rewriting `id` and adding
+  `account_id` with `json_set`. It runs through the store's native client
+  (`client().run`), so the copy stays on the database side and the Worker
+  bundle does not carry the dataset.
+- **Lists always pass `limit$`.** The store's default page size is 11.
 
 **The costs of a full copy, stated.**
 
@@ -370,11 +385,34 @@ The generated `devapi-access/` package wraps these in a typed facade
 also provides the migrations for its two tables, and a **local CLI** over the
 facade, which works directly on a SQLite file.
 
-### 4.5 Issuing keys on a deployed server
+### 4.5 The admin endpoint: how the portal reaches a deployed server
 
-How `voxgig/portal` issues keys and initialises accounts on a deployed server
-is **deliberately undecided** (open question Q1). v1 ships the programmatic
-interface and the local CLI, and nothing reachable over HTTP.
+`voxgig/portal` creates accounts, initialises their data, and issues and
+revokes keys by **sending Seneca messages over HTTP** to one admin endpoint
+on each server. That endpoint is `@seneca/gateway`'s transport-agnostic
+handler. On Workers it is mounted through `@seneca/gateway-cloudflare`.
+
+- **Path.** `/devapi-admin` by default, set by `admin.path`. It cannot start
+  with `_`, which Astro excludes from file routing. Generation refuses a model
+  route that collides with it.
+- **Allow list.** The gateway's `allow` option admits only:
+  - `sys:devapi-access` messages;
+  - `sys:devapi-data,init:account` and `sys:devapi-data,remove:account`.
+
+  Data operations stay behind the API routes and their keys.
+- **Service token.** Every call carries `Authorization: Bearer
+  $DEVAPI_ADMIN_TOKEN`. The generated server checks the token, in constant
+  time, before it hands the request to the gateway. `@seneca/gateway-auth` has
+  no bearer spec for Cloudflare, only its cookie helper. With no token set,
+  the endpoint answers 404.
+- **No CORS.** The gateway's default `Access-Control-Allow-Origin: *` is
+  overridden. The portal calls from its server, not from a browser.
+- **Both servers.** Fastify mounts the same handler on the same path, so the
+  portal talks to either server the same way.
+
+For local work there is also the CLI over the programmatic interface (§4.4).
+Pointed at a deployed database through the D1 store's REST mode, it is an
+operator's fallback that needs no admin endpoint.
 
 ### 4.6 A key for local live tests
 
@@ -441,10 +479,12 @@ matching the source).
 ```
 devapi-fastify/
   package.json            # fastify 5; seneca 4 rc; seneca-entity; seneca-promisify;
-                          # @seneca/sqlite-store; file:../devapi-data; file:../devapi-access
+                          # @seneca/cloudflare-d1-store; @seneca/gateway;
+                          # file:../devapi-data; file:../devapi-access
   src/server.ts           # build and listen
   src/routes.ts           # one Fastify route per point, with its JSON Schemas
-  src/seneca.ts           # store (node driver) + access + data + custom
+  src/admin.ts            # the admin endpoint (4.5)
+  src/seneca.ts           # store (node:sqlite client) + access + data + custom
   src/custom.ts           # user-owned
   openapi.json            # the copied definition
   test/server.test.ts     # node:test with fastify.inject
@@ -455,9 +495,12 @@ devapi-fastify/
 - **Validation** is Fastify's own: each route declares the spec's schemas, and
   Fastify validates them with ajv. The ajv options match the Cloudflare
   server's (§7), so the two servers accept and reject the same requests.
-- **Storage** is `@seneca/sqlite-store`'s node driver, in
-  `.devapi/devapi.sqlite`. The migrations from `devapi-data` and
-  `devapi-access` are applied at startup. `npm run db:reset` deletes the file.
+- **Storage** is `@seneca/cloudflare-d1-store` with its new `node:sqlite`
+  client, in `.devapi/devapi.sqlite`.
+  - The migrations are the same files the Cloudflare server applies with
+    wrangler. Here they are applied at startup and tracked in a
+    `d1_migrations` table, the way wrangler tracks them.
+  - `npm run db:reset` deletes the file.
 - **Sibling packages.**
   - The dependencies on `devapi-data` and `devapi-access` are `file:` paths.
     They are computed from those targets' actual output locations, so they
@@ -477,14 +520,16 @@ devapi-fastify/
 ```
 devapi-cloudflare/
   package.json            # astro, @astrojs/cloudflare, wrangler; seneca 4 rc; seneca-entity;
-                          # seneca-promisify; @seneca/sqlite-store; file: siblings
+                          # seneca-promisify; @seneca/cloudflare-d1-store; @seneca/gateway;
+                          # @seneca/gateway-cloudflare; file: siblings
   astro.config.mjs        # output: 'server', adapter: cloudflare({...})
   wrangler.jsonc          # nodejs_compat; d1_databases: DEVAPI_DB; migrations_dir
   migrations/             # devapi-data's and devapi-access's, gathered at generation
   src/pages/<route>.ts    # one endpoint file per path, exporting its methods
+  src/pages/devapi-admin.ts   # the admin endpoint (4.5)
   src/pages/openapi.json.ts
   src/validate/*.js       # ajv-standalone validators, precompiled at sdkgen generation
-  src/lib/seneca.ts       # lazy, once-per-isolate Seneca with the D1 driver
+  src/lib/seneca.ts       # lazy, once-per-isolate Seneca with the D1 store
   src/custom.ts           # user-owned
   test/worker.test.ts     # node:test driving the built Worker under wrangler dev / Miniflare
   README.md
@@ -507,6 +552,9 @@ devapi-cloudflare/
   request and is reused for the isolate's lifetime. Plugins are passed as
   objects, not names, and seneca-entity takes `mem_store: false`
   (Appendix A).
+- **The D1 binding is wrapped in tests.** The D1 store's README notes that
+  Miniflare's `D1Database` is a Proxy, which can trip Seneca's option merge.
+  Generated tests pass a plain `{ prepare, batch, exec }` wrapper.
 - **Adapter defaults are turned off.** `@astrojs/cloudflare` adds a `SESSION`
   KV binding and an `IMAGES` binding by default (Appendix A). The generated
   config disables both, so deploying needs only D1.
@@ -517,7 +565,8 @@ devapi-cloudflare/
   1. Create the database with `wrangler d1 create`, and put its id in the model
      (`devapi-cloudflare: d1: database_id`). Generation overwrites
      `wrangler.jsonc`, so the id cannot live there.
-  2. Set `DEVAPI_KEY_PEPPER` with `wrangler secret put`.
+  2. Set `DEVAPI_KEY_PEPPER` and `DEVAPI_ADMIN_TOKEN` with
+     `wrangler secret put`.
   3. Run `npm run deploy`. It runs `astro build` first, then the remote
      migrations, then `wrangler deploy`. Migrations are additive only (expand
      now, contract in a later release), because the running Worker must keep
@@ -525,39 +574,62 @@ devapi-cloudflare/
 
 ---
 
-## 8. @seneca/sqlite-store, with a D1 driver
+## 8. The Seneca Cloudflare packages
 
-Storage uses
-[`senecajs/seneca-sqlite-store`](https://github.com/senecajs/seneca-sqlite-store),
-extended with a D1 driver.
+Five `senecajs` packages already exist for Cloudflare. Two are used in v1.
 
-**Its state as found:**
+| package | repository | used for |
+|---|---|---|
+| `@seneca/cloudflare-d1-store` | [SenecaCloudflareD1Store](https://github.com/senecajs/SenecaCloudflareD1Store) | **storage on both servers** |
+| `@seneca/gateway-cloudflare` | [SenecaCloudflareGateway](https://github.com/senecajs/SenecaCloudflareGateway) | **the admin endpoint on Workers** (4.5) |
+| `@seneca/cloudflare-do-store` | [SenecaCloudflareDOStore](https://github.com/senecajs/SenecaCloudflareDOStore) | not in v1. A Durable Object has its own storage, so this is the escalation path if full per-account copies outgrow one D1 database (3.5) |
+| `@seneca/cloudflare-r2-store` | [SenecaCloudflareR2Store](https://github.com/senecajs/SenecaCloudflareR2Store) | not in v1. A candidate for publishing the CSV and JSON dataset for download through the portal |
+| `@seneca/cloudflare-kv-store` | [SenecaCloudflareKVStore](https://github.com/senecajs/SenecaCloudflareKVStore) | not in v1. KV is eventually consistent, so it is unsuited to keys that must revoke promptly |
 
-- The repository's `package.json` names `@seneca/sqlite-store` at 0.0.3, but
-  that package is not on npm. The older `seneca-sqlite-store` was unpublished
-  on 2025-12-08.
-- It drives the native `sqlite3` module through its callback API, which cannot
-  run on workerd.
-- It is developed against Seneca 3.23, seneca-entity 14 and
-  `seneca-store-test` 4, with `@hapi/lab` tests.
-- It already reads a table's columns with `PRAGMA table_info`, and keeps
-  object fields as JSON. Both carry over to D1 unchanged.
+**Their state, as found.**
 
-**The work:**
+- **Versions.** All five are at 0.0.1, and **none is on npm**.
+- **Tests.** All five are tested with jest and Miniflare.
+  - The D1 store's 15 tests pass. Its peer range `seneca >=3` resolves to
+    Seneca 3.38; with `4.0.0-rc5` swapped in, all 15 still pass.
+  - The gateway's 9 tests pass, on Seneca `4.0.0-rc4`.
+- **Unused test suite.** The D1 store lists `seneca-store-test` but does not
+  run it.
+- **An open question answered.** The gateway's README leaves open whether
+  Seneca's plugin loading works inside a Worker. Spike 0.1 answers it: it
+  does, when plugins are passed as objects (Appendix A).
 
-- **A driver layer under one SQL builder.**
-  - `driver: 'node'` uses `node:sqlite`, so no native build is needed, with
-    `sqlite3` kept as an option.
-  - `driver: 'd1'` takes a `D1Database` binding, or a function returning one.
-  - All calls become async.
-- **A `native$` path** for the batched `INSERT … SELECT` that initialises an
-  account (§3.5).
-- **Move to Seneca 4 rc and seneca-entity 28.** Run `seneca-store-test` 6 on
-  both drivers, with D1 run through `wrangler dev` or Miniflare.
-- **Publish** as `@seneca/sqlite-store`.
+**The D1 store's design, which the plan adopts (3.5).**
 
-The spike's prototype D1 store, about 90 lines, shows the D1 side is small
-(Appendix A).
+- One table per canon, `(id TEXT PRIMARY KEY, data TEXT)`, holding each record
+  as JSON, and created on first use.
+- `list$` filtering through `json_extract`, with `sort$`, `limit$`, `skip$`
+  and `fields$`.
+- A partial update merges into the stored record.
+- Two clients behind a two-method `query`/`run` interface: the Workers
+  binding, and Cloudflare's REST API for use from Node.
+
+**The work needed in each.**
+
+- **The D1 store:**
+  - A **`node:sqlite` client** behind the same `query`/`run` interface, so
+    the Fastify server uses this store on a local file. That needs SQLite's
+    JSON functions, which `node:sqlite` includes.
+  - Run `seneca-store-test` on all three clients: binding (through Miniflare),
+    `node:sqlite`, and REST (mocked).
+  - Make the default page size of 11 explicit in its README, or remove it. The
+    generated plugin passes `limit$` either way.
+  - Make sure tables that migrations create first, with their own indexes,
+    are left alone, which `CREATE TABLE IF NOT EXISTS` already does.
+  - Publish.
+- **The gateway:**
+  - Publish it, along with any `@seneca/gateway` changes it needs.
+  - Document mounting it behind a caller-supplied token check (4.5), and
+    overriding its default CORS headers.
+- **The other three:** nothing for v1.
+
+`senecajs/seneca-sqlite-store` is no longer needed for v1 (D18 supersedes
+D12).
 
 ---
 
@@ -566,7 +638,8 @@ The spike's prototype D1 store, about 90 lines, shows the D1 side is small
 | what | where |
 |---|---|
 | The four targets | this repository, `@voxgig/sdkgen-portalpack` |
-| The SQLite and D1 store | `senecajs/seneca-sqlite-store`, published as `@seneca/sqlite-store` |
+| Storage, on both servers | `senecajs/SenecaCloudflareD1Store`, published as `@seneca/cloudflare-d1-store` |
+| The admin endpoint | `@seneca/gateway` (published) and `senecajs/SenecaCloudflareGateway`, published as `@seneca/gateway-cloudflare` |
 | The developer and agent portal | `voxgig/portal` (separate, later) |
 | Everything else | generated, for one API, into the SDK repository |
 
@@ -600,6 +673,7 @@ be fixed in Phase 1.
 | | `limits.accounts`, `limits.records` | unset, `10000` | how many accounts may be initialised; rows per account per entity |
 | `devapi-access` | `key.prefix` | the API slug | |
 | | `cache.ttl` | `30` | seconds |
+| | `admin.path` | `/devapi-admin` | the admin endpoint (4.5); absent without `DEVAPI_ADMIN_TOKEN` |
 | `devapi-fastify` | `port` | `8901` | |
 | | `db.file` | `.devapi/devapi.sqlite` | |
 | `devapi-cloudflare` | `worker.name` | `<slug>-devapi` | |
@@ -636,9 +710,10 @@ a local publish.
 
 | layer | where | what |
 |---|---|---|
-| Store | `seneca-sqlite-store` | `seneca-store-test` on the node and D1 drivers; the batched `INSERT … SELECT` |
+| Store | `SenecaCloudflareD1Store` | `seneca-store-test` on the binding (Miniflare), `node:sqlite` and REST clients; the `INSERT … SELECT` init copy; the expression indexes being used |
+| Admin endpoint | servers | Only the allow-listed patterns pass; a missing or wrong token answers 401; with no token configured the endpoint is absent; no CORS headers |
 | Generation | here, on `@voxgig/sdkgen/testkit` | Each target on a solardemo-shaped fixture: planet, with moon nested under it, the `terraform` and `forbid` actions, and a create answering 201. Checks: the files emitted; no placeholder leaks; the "requires `devapi-data` and `devapi-access`" error; the unsupported-auth error; a cycle in `per`; a route path collision falling back to the catch-all; the CSV matching a golden copy, byte for byte; the copies of `Shared_devapi.ts` being identical. |
-| Generated plugins | in each generated package's suite, run here in `servers.yml` | `sys:devapi-data` on the mem store and the node driver: init, reset, the operation table (3.6), and request and response transforms against the case table shared with `TestFeature.ts`. `sys:devapi-access`: generate, verify, revoke, rotate, and expiry honoured on a cache hit. |
+| Generated plugins | in each generated package's suite, run here in `servers.yml` | `sys:devapi-data` on the mem store and the D1 store's `node:sqlite` client: init, reset, the operation table (3.6), and request and response transforms against the case table shared with `TestFeature.ts`. `sys:devapi-access`: generate, verify, revoke, rotate, and expiry honoured on a cache hit. |
 | Servers | here, in `servers.yml` (like langpack's `sdks.yml`) | Generate both servers, install and build them. Run Fastify under Node and the Cloudflare server under `wrangler dev`. Run one request script against each. |
 | **Parity** | here, in `servers.yml` | The same script against both servers gives identical responses once ids and timestamps are normalised, including the validation failures. |
 | SDK round trip | here, in `servers.yml` | Where `ts` is generated, its live suite runs against both servers with a devapi-access key. |
@@ -655,7 +730,8 @@ schedule.
 |---|---|
 | ~~Seneca on workerd~~ | **Retired by spike 0.1** (Appendix A). |
 | Seneca 4 is a release candidate | Pin it exactly. The spike ran on `4.0.0-rc5`. |
-| Modernising `seneca-sqlite-store` | It is the first piece of work (Phase 2), gated on `seneca-store-test`. The spike's prototype D1 store shows the size of the D1 driver. |
+| The Seneca Cloudflare packages are 0.0.1 and unpublished | Phase 2 runs `seneca-store-test` on the D1 store and publishes it and the gateway before any target depends on them. |
+| `json_extract` queries scan the table | Expression indexes on `account_id`, created by the generated migrations (3.5). |
 | Full-copy storage growth | `limits.accounts`, the arithmetic stated in the README, and the copy staying on the database side (3.5). |
 | Fidelity of the JSON Schemas | apidef's resolved schemas can be cyclic. Bound them with `boundedFacts`, and test the ajv-standalone output against the same fixtures as Fastify. |
 | Response-shape fidelity | The case table shared with `TestFeature.ts`, and the SDK round trip in CI. |
@@ -677,12 +753,15 @@ schedule.
 1. **Pack scaffold.** Manifests, gates, CI, the agent guide, the target
    models, and `Shared_devapi.ts`. *Exit:* `npm test` and `package check` are
    green.
-2. **`@seneca/sqlite-store`**: drivers and Seneca 4. *Exit:* `seneca-store-test`
-   is green on node and D1, and the package is published.
+2. **The Seneca Cloudflare packages.** Add the D1 store's `node:sqlite`
+   client, and publish the store and the gateway. *Exit:* `seneca-store-test`
+   is green on all three of the D1 store's clients, and both packages are on
+   npm.
 3. **`devapi-data`.** *Exit:* solardemo's CSV and JSON are byte-identical
    across runs; the plugin's operation table and init and reset pass on the
-   node driver.
-4. **`devapi-access`.** *Exit:* the key lifecycle passes on mem, node and D1.
+   `node:sqlite` client.
+4. **`devapi-access`.** *Exit:* the key lifecycle passes on mem, `node:sqlite`
+   and D1.
 5. **`devapi-fastify`.** *Exit:* the generated TypeScript SDK's live suite
    passes against it, and so do the isolation tests.
 6. **`devapi-cloudflare`.** *Exit:* the same suite passes under
@@ -696,27 +775,30 @@ Phases 2 and 3 can run in parallel once Phase 1 lands.
 
 ## 15. Decisions
 
-These were made in the first review.
+These were made in review. D17 and D18 came after the Seneca Cloudflare
+packages were pointed out, and D18 supersedes D12.
 
 | # | question | ruling |
 |---|---|---|
 | D1 | sdkgen kind | four targets, `parity: CONSUMER` |
-| D2 | Runtime code | none shared. The business logic is generated per API: `devapi-data` generates `sys:devapi-data`, and `devapi-access` generates `sys:devapi-access`. Storage uses `senecajs/seneca-sqlite-store`. |
+| D2 | Runtime code | none shared. The business logic is generated per API: `devapi-data` generates `sys:devapi-data`, and `devapi-access` generates `sys:devapi-access`. |
 | D3 | Per-account storage | a full **copy of the seed per account** |
 | D3a | When the copy is made | an **explicit init call**; until then requests answer 403 `account_not_initialised` |
 | D4 | What an account is | an **opaque id with a status**, supplied by the caller, with keys issued under it; devapi-access is about keys, not users |
 | D5 | Key hashing | HMAC-SHA-256 with a server pepper |
-| D6 | Getting keys | `voxgig/portal` will provide the developer and agent portal; how it connects is decided later (Q1) |
+| D6 | Getting keys | `voxgig/portal` will provide the developer and agent portal (see D17) |
 | D7 | When data is generated | at sdkgen generation time, committed |
 | D8 | Request validation | the **OpenAPI JSON Schemas** |
 | D9 | Cloudflare routing | **one generated file per route**, with a catch-all only for collisions |
 | D10 | Seneca | the 4.0.0 RC line |
 | D11 | Linking server packages | sibling `file:` dependencies |
-| D12 | D1 support | a D1 driver in `seneca-sqlite-store` |
+| D12 | D1 support | ~~a D1 driver in `seneca-sqlite-store`~~, superseded by D18 |
 | D13 | Scopes | none in v1 |
 | D14 | Paging | explicit model configuration |
 | D15 | Serving the definition | yes, copied in |
 | D16 | Target name | `devapi-cloudflare` |
+| D17 | How the portal reaches a deployed server | an **admin endpoint** on both servers: `@seneca/gateway`, through `@seneca/gateway-cloudflare` on Workers, allow-listed and guarded by a service token (4.5) |
+| D18 | Storage | **`@seneca/cloudflare-d1-store` on both servers**: the D1 binding on Workers, and a new `node:sqlite` client on Node |
 
 ---
 
@@ -724,13 +806,8 @@ These were made in the first review.
 
 ### Open questions
 
-- **Q1. How does `voxgig/portal` reach a deployed server?** It needs to create
-  accounts, initialise their data, and issue and revoke keys. The options are
-  an admin HTTP API guarded by a service token, or a shared binding to the same
-  D1 database with the generated interfaces called in process. Until this is
-  decided, a deployed Cloudflare server has no supported way to get keys. A
-  possible stopgap is a CLI mode that emits SQL for
-  `wrangler d1 execute --remote`.
+- **Q1. How the portal reaches a server.** Resolved as D17: the admin
+  endpoint (4.5).
 - **Q2. Removing an account.** Should `devapi-access` `remove:account` also
   trigger `sys:devapi-data,remove:account`, or should the caller always make
   both calls, as v1 does?
@@ -742,11 +819,11 @@ These were made in the first review.
 - key scopes, rate limits and usage metering;
 - per-API error bodies;
 - collection-action defaults;
-- any HTTP surface for account or key management (Q1).
+- self-service signup on the mock servers. That belongs to the portal.
 
 ### Later
 
-1. The portal integration (Q1).
+1. `voxgig/portal` built on the admin endpoint (D17).
 2. `seedFor('sdk-test')` wired into the TypeScript SDK's `test` feature.
 3. Collection-action defaults built from the response schemas.
 4. A generated deploy workflow for `devapi-cloudflare`.
@@ -762,7 +839,10 @@ D1, well enough to carry the design in §2? **Answer: yes.** The code is in
 **What was built.**
 
 - A prototype D1 store for seneca-entity, about 90 lines, with equality
-  queries.
+  queries. It was written before `@seneca/cloudflare-d1-store` came to light,
+  and now stands in for that store. The real store keeps each record as a JSON
+  `data` column, where the prototype used one column per field. Its 15 tests
+  also pass on Seneca 4.0.0-rc5 (§8), so the result carries over.
 - A prototype `sys:devapi-data` plugin with explicit per-account init and CRUD
   scoped to one account.
 - Generated-style Astro endpoint files for `/planet` and `/planet/[id]`.

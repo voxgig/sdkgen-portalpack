@@ -35,7 +35,7 @@ curl -X POST -H 'content-type: application/json' \
 
 | file | stands in for |
 |---|---|
-| `src/lib/d1store.ts` | the D1 driver planned for `@seneca/sqlite-store` (equality queries only) |
+| `src/lib/d1store.ts` | `@seneca/cloudflare-d1-store`, which the plan now uses. The prototype does equality queries only, and uses one column per field where the real store keeps a JSON `data` column |
 | `src/lib/devapi-data.ts` | the generated `sys:devapi-data` plugin: explicit per-account init, and CRUD scoped to one account |
 | `src/lib/seneca.ts` | the generated Seneca setup: plugins passed as objects, the store bound to `env` from `cloudflare:workers`, started lazily once per isolate |
 | `src/pages/planet/*.ts` | the generated file-per-route Astro endpoints |
