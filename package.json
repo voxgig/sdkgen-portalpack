@@ -1,0 +1,29 @@
+{
+  "name": "@voxgig/sdkgen-portalpack",
+  "version": "0.0.1",
+  "description": "Developer-portal targets for the Voxgig SDK Generator: mock APIs, data and API keys. Placeholder release; not yet usable.",
+  "license": "MIT",
+  "keywords": [
+    "voxgig",
+    "sdkgen",
+    "sdkgen-package",
+    "mock-api",
+    "devapi"
+  ],
+  "author": "Richard Rodger (http://richardrodger.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voxgig/sdkgen-portalpack.git"
+  },
+  "homepage": "https://github.com/voxgig/sdkgen-portalpack",
+  "files": [
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
