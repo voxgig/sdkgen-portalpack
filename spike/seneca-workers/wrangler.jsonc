@@ -1,0 +1,13 @@
+{
+  "name": "spike-seneca-workers",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DEVAPI_DB",
+      "database_name": "spike-devapi",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
